@@ -152,7 +152,7 @@ contract WriterVaultTest is BaseTest {
         uint256 id = _sellTickets(1000e18);
         uint256 aliceShares = vault.accountOf(alice).shares;
         vm.prank(alice);
-        vault.withdraw(aliceShares); // queued: the ETH is at risk until the round ends
+        vault.requestWithdraw(aliceShares); // queued: the ETH is at risk until the round ends
         assertEq(vault.pendingWithdrawShares(), aliceShares);
         _exercise(id, 1000e18);
         toSettled(id);
@@ -223,7 +223,80 @@ contract WriterVaultTest is BaseTest {
         uint256 shares = vault.accountOf(alice).shares;
         vm.prank(alice);
         vm.expectRevert(WriterVault.InsufficientShares.selector);
-        vault.withdraw(shares + 1);
+        vault.requestWithdraw(shares + 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Review fixes
+    // ------------------------------------------------------------------
+
+    function test_InstantWithdrawRevertsDuringARound() public {
+        _deposit(alice, 1 ether);
+        vault.startRound();
+        uint256 shares = vault.accountOf(alice).shares;
+        vm.prank(alice);
+        vm.expectRevert(WriterVault.RoundActive.selector);
+        vault.withdraw(shares);
+    }
+
+    function test_RequestWithdrawOnlyDuringARound() public {
+        _deposit(alice, 1 ether);
+        uint256 id = vault.startRound();
+        toSettled(id);
+        vault.endRound();
+        uint256 shares = vault.accountOf(alice).shares;
+        vm.prank(alice);
+        vm.expectRevert(WriterVault.NoActiveRound.selector);
+        vault.requestWithdraw(shares);
+    }
+
+    function test_CancelWithdrawUntilTheAuction() public {
+        _deposit(alice, 1 ether);
+        uint256 id = vault.startRound();
+        uint256 shares = vault.accountOf(alice).shares;
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+        vm.prank(alice);
+        vault.cancelWithdraw();
+        assertEq(vault.accountOf(alice).shares, shares);
+        assertEq(vault.pendingWithdrawShares(), 0);
+
+        vm.prank(alice);
+        vault.requestWithdraw(shares);
+        toAuction(id);
+        vm.prank(alice);
+        vm.expectRevert(WriterVault.AuctionStarted.selector);
+        vault.cancelWithdraw();
+    }
+
+    /// @dev Review finding: endRound and startRound could be bundled so holders never had an idle window.
+    function test_TwelveHoursBetweenRounds() public {
+        _deposit(alice, 1 ether);
+        uint256 id = vault.startRound();
+        toSettled(id);
+        seed(336); // the keeper keeps recording, so a series could open
+        vault.endRound();
+        seed(23); // 11.5 hours later
+        vm.expectRevert(WriterVault.TooSoon.selector);
+        vault.startRound();
+        uint256 shares = vault.accountOf(alice).shares;
+        vm.prank(alice);
+        vault.withdraw(shares / 2); // the window to leave exists
+        seed(1);
+        vault.startRound();
+    }
+
+    /// @dev Review finding: dust or forced ETH could start a round with no shares at risk.
+    function test_NoRoundWithoutSharesOrBelowTheMinimum() public {
+        vm.deal(address(vault), 1 ether); // forced ETH, as through selfdestruct
+        vm.expectRevert(WriterVault.NothingToDeploy.selector);
+        vault.startRound();
+        vm.deal(address(vault), 0);
+        _deposit(mallory, 0.05 ether);
+        vm.expectRevert(WriterVault.NothingToDeploy.selector);
+        vault.startRound();
+        _deposit(alice, 0.05 ether);
+        vault.startRound(); // 0.1 ETH: enough
     }
 
     function test_RoundWithUnpaidLoanSharesTheSimd() public {
@@ -262,7 +335,7 @@ contract WriterVaultTest is BaseTest {
         if (aliceLeaves) {
             uint256 aliceShares = vault.accountOf(alice).shares;
             vm.prank(alice);
-            vault.withdraw(aliceShares);
+            vault.requestWithdraw(aliceShares);
         }
         exercised = uint96(bound(exercised, 0, sold));
         if (exercised != 0) _exercise(id, exercised);

@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Status** | Built and tested, not deployed. Unit, fuzz and mainnet-fork tests pass. An internal adversarial review of the core contracts found two confirmed issues (deposit squatting, repaid-loan capacity) and several pricing and liveness issues; all are fixed and covered by tests. Not externally audited. |
+| **Status** | Built and tested, not deployed. Unit, fuzz and mainnet-fork tests pass. Internal adversarial reviews of the core contracts and the writer vault found no loss of funds; every confirmed issue is fixed and covered by tests. Not externally audited. See [NEXT_STEPS.md](NEXT_STEPS.md) for where development stopped. |
 | **Chain** | Ethereum mainnet only: sIMD exists only there. |
 | **Token** | None. Fees are paid in ETH. |
 
@@ -159,7 +159,9 @@ startRound()   the next week a series is open: the same shares roll into it auto
 
 - **One series at a time.** A 7-day series takes 12 days from opening to settlement, so the weekly vault runs a round every two weeks; the monthly vault about every five.
 - **Shares are priced only between rounds**, when the vault holds nothing but ETH, so no price oracle is involved. Deposits always wait for the next round and become shares at its starting price, and can be cancelled until then.
-- **Withdrawals** are instant between rounds. During a round the shares stay at risk and their ETH is paid at the round's closing price; claim it with `claim()`.
+- **Withdrawals:** `withdraw` is instant between rounds and reverts during one. During a round, `requestWithdraw` queues shares to be paid at the round's closing price (claim with `claim()`); `cancelWithdraw` puts them back until the series' auction starts. A round can start only 12 hours after the previous one ended, so every round is followed by a real window to leave.
+- **No deposit-window exit.** The vault joins every series of its product on the terms it opened with, whoever opened it. ETH the series does not use (above the series cap, or unsold) is returned at the round's end, not earlier.
+- **A round needs at least 0.1 ETH and shares at risk**, so dust or forced ETH cannot occupy the vault.
 - **IMD and sIMD** that the vault receives (exercised tickets, unpaid loans) are not part of the share price. They are split among that round's shareholders pro rata and claimed with `claim()`, so writers get the discounted IMD they signed up for. Depositors who join later get none of an earlier round's IMD.
 - **No owner, no fee.** `startRound` and `endRound` are permissionless; the keeper script calls them. Shares are not transferable in this version.
 

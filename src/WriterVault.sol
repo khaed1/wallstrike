@@ -19,8 +19,11 @@ import {IStakedIMD} from "./interfaces/IStakedIMD.sol";
 /// Shares are priced only between rounds, when everything the vault holds is ETH, so no price oracle is
 /// needed:
 /// - deposits always wait for the next round and become shares at its starting price;
-/// - withdrawals are instant between rounds; during a round they are paid at its end, since that ETH is at
-///   risk until then.
+/// - `withdraw` is instant between rounds. During a round, `requestWithdraw` queues shares to be paid at
+///   the round's end (cancellable until the series' auction starts). A round can start only 12 hours after
+///   the previous one ended, so every round is followed by a real window to withdraw.
+/// The vault joins every series of its product on the terms it opened with: unlike a direct writer, it does
+/// not withdraw during the deposit window. ETH the series does not use is returned at the round's end.
 /// IMD and sIMD delivered to the vault (exercised tickets, unpaid loans) are not part of the share price.
 /// They are paid out to the round's shareholders pro rata, to claim at any time. sIMD only ever moves by
 /// transfer.
@@ -34,6 +37,10 @@ contract WriterVault is ReentrancyGuard {
     /// @dev Virtual shares and ETH make a donation to the vault worthless as an attack on depositors.
     uint256 internal constant VIRTUAL_SHARES = 1e6;
     uint256 internal constant VIRTUAL_ETH = 1;
+    /// @notice Minimum time between the end of a round and the start of the next, for withdrawals.
+    uint256 public constant MIN_IDLE = 12 hours;
+    /// @notice A round must put at least this much ETH at risk, so dust cannot occupy the vault.
+    uint256 public constant MIN_ROUND_ETH = 0.1 ether;
 
     struct Account {
         uint256 shares;
@@ -71,6 +78,7 @@ contract WriterVault is ReentrancyGuard {
     uint256 public pendingWithdrawShares;
     /// @notice ETH set aside for processed withdrawals, not yet claimed.
     uint256 public reservedEth;
+    uint256 public lastEndedAt;
     /// @notice Cumulative IMD and sIMD per share, scaled by 1e27.
     uint256 public accImd;
     uint256 public accSimd;
@@ -83,6 +91,7 @@ contract WriterVault is ReentrancyGuard {
     event Deposited(address indexed user, uint256 eth, uint64 round);
     event DepositCancelled(address indexed user, uint256 eth);
     event WithdrawQueued(address indexed user, uint256 shares, uint64 round);
+    event WithdrawCancelled(address indexed user, uint256 shares, uint64 round);
     event Withdrawn(address indexed user, uint256 shares, uint256 eth);
     event Claimed(address indexed user, uint256 eth, uint256 imd, uint256 simdShares);
     event RoundStarted(uint64 indexed round, uint256 indexed seriesId, uint256 eth, uint256 sharesMinted);
@@ -96,6 +105,8 @@ contract WriterVault is ReentrancyGuard {
     error InsufficientShares();
     error NothingPending();
     error OnlyWallstrike();
+    error TooSoon();
+    error AuctionStarted();
 
     constructor(Wallstrike wallstrike_, uint8 line_, uint8 tenorId_) {
         if (line_ >= wallstrike_.LINES() || tenorId_ >= wallstrike_.TENORS()) revert Wallstrike.InvalidLineOrTenor();
@@ -139,26 +150,42 @@ contract WriterVault is ReentrancyGuard {
         Address.sendValue(payable(msg.sender), eth);
     }
 
-    /// @notice Withdraws shares. Between rounds this pays ETH at once; during a round the shares stay at
-    /// risk and their ETH becomes claimable when the round ends.
-    function withdraw(uint256 shares) external nonReentrant {
-        if (shares == 0) revert ZeroAmount();
+    /// @notice Withdraws shares for ETH at once. Only between rounds; during a round use `requestWithdraw`.
+    function withdraw(uint256 shares) external nonReentrant returns (uint256 eth) {
+        if (activeSeries != 0) revert RoundActive();
+        Account memory a = _takeShares(shares);
+        eth = Math.mulDiv(shares, nav() + VIRTUAL_ETH, totalShares + VIRTUAL_SHARES);
+        totalShares -= shares;
+        _accounts[msg.sender] = a;
+        emit Withdrawn(msg.sender, shares, eth);
+        Address.sendValue(payable(msg.sender), eth);
+    }
+
+    /// @notice During a round, queues shares to leave at its end. They stay at risk until then and are paid
+    /// at the round's closing price, with their share of any IMD and sIMD; collect with `claim`.
+    function requestWithdraw(uint256 shares) external nonReentrant {
+        if (activeSeries == 0) revert NoActiveRound();
+        Account memory a = _takeShares(shares);
+        a.withdrawShares += shares;
+        a.withdrawRound = round;
+        pendingWithdrawShares += shares;
+        _accounts[msg.sender] = a;
+        emit WithdrawQueued(msg.sender, shares, round);
+    }
+
+    /// @notice Puts queued shares back in the round, until the series' auction starts.
+    function cancelWithdraw() external nonReentrant {
+        if (activeSeries == 0) revert NoActiveRound();
+        if (block.timestamp >= wallstrike.getSeries(activeSeries).auctionStart) revert AuctionStarted();
         Account memory a = _synced(_accounts[msg.sender]);
-        if (a.shares < shares) revert InsufficientShares();
-        a.shares -= shares;
-        if (activeSeries != 0) {
-            a.withdrawShares += shares;
-            a.withdrawRound = round;
-            pendingWithdrawShares += shares;
-            _accounts[msg.sender] = a;
-            emit WithdrawQueued(msg.sender, shares, round);
-        } else {
-            uint256 eth = Math.mulDiv(shares, nav() + VIRTUAL_ETH, totalShares + VIRTUAL_SHARES);
-            totalShares -= shares;
-            _accounts[msg.sender] = a;
-            emit Withdrawn(msg.sender, shares, eth);
-            Address.sendValue(payable(msg.sender), eth);
-        }
+        uint256 shares = a.withdrawShares;
+        if (shares == 0) revert NothingPending();
+        a.withdrawShares = 0;
+        a.withdrawRound = 0;
+        a.shares += shares;
+        pendingWithdrawShares -= shares;
+        _accounts[msg.sender] = a;
+        emit WithdrawCancelled(msg.sender, shares, round);
     }
 
     /// @notice Pays out ETH from processed withdrawals and the caller's share of delivered IMD and sIMD.
@@ -181,9 +208,11 @@ contract WriterVault is ReentrancyGuard {
     // ------------------------------------------------------------------
 
     /// @notice Starts a round in this week's series for the vault's product, opening the series if nobody
-    /// has yet. Converts queued deposits to shares and deposits all of the vault's ETH as a writer.
+    /// has yet. Converts queued deposits to shares and deposits all of the vault's ETH as a writer. Needs
+    /// `MIN_IDLE` since the last round ended, shares at risk, and at least `MIN_ROUND_ETH`.
     function startRound() external nonReentrant returns (uint256 seriesId) {
         if (activeSeries != 0) revert RoundActive();
+        if (block.timestamp < lastEndedAt + MIN_IDLE) revert TooSoon();
         seriesId = wallstrike.seriesByKey(keccak256(abi.encode(block.timestamp / 1 weeks, line, tenorId)));
         if (seriesId == 0) seriesId = wallstrike.openSeries(line, tenorId);
         if (block.timestamp >= wallstrike.getSeries(seriesId).auctionStart) revert DepositWindowClosed();
@@ -198,7 +227,7 @@ contract WriterVault is ReentrancyGuard {
         pendingDepositEth = 0;
 
         uint256 eth = address(this).balance - reservedEth;
-        if (eth == 0) revert NothingToDeploy();
+        if (totalShares == 0 || eth < MIN_ROUND_ETH) revert NothingToDeploy();
         activeSeries = seriesId;
         roundSeries[r] = seriesId;
         emit RoundStarted(r, seriesId, eth, minted);
@@ -219,6 +248,7 @@ contract WriterVault is ReentrancyGuard {
 
         uint64 r = round;
         activeSeries = 0;
+        lastEndedAt = block.timestamp;
         if (totalShares != 0) {
             accImd += Math.mulDiv(imdIn, ACC, totalShares);
             accSimd += Math.mulDiv(simdIn, ACC, totalShares);
@@ -251,6 +281,14 @@ contract WriterVault is ReentrancyGuard {
     /// @notice ETH value of `shares` between rounds.
     function previewWithdraw(uint256 shares) external view returns (uint256) {
         return Math.mulDiv(shares, nav() + VIRTUAL_ETH, totalShares + VIRTUAL_SHARES);
+    }
+
+    /// @dev Syncs the caller's account and removes `shares` from its settled balance.
+    function _takeShares(uint256 shares) internal view returns (Account memory a) {
+        if (shares == 0) revert ZeroAmount();
+        a = _synced(_accounts[msg.sender]);
+        if (a.shares < shares) revert InsufficientShares();
+        a.shares -= shares;
     }
 
     /// @dev Applies everything that has happened since the account was last touched: payouts on its
