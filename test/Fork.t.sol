@@ -33,7 +33,7 @@ contract ForkTest is Test {
         vm.createSelectFork(rpc);
         live = true;
         recorder = new ImdPriceRecorder(HOOK, MANAGER, SIMD, MAIN_POOL);
-        ws = new Wallstrike(IMD, SIMD, HOOK, recorder, address(this), address(this));
+        ws = new Wallstrike(IMD, SIMD, HOOK, recorder, address(this), address(this), address(0));
         vm.deal(writer, 20 ether);
         vm.deal(buyer, 20 ether);
         vm.deal(borrower, 1 ether);

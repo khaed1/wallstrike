@@ -12,9 +12,9 @@ import {ICappedBurnHook} from "../src/interfaces/ICappedBurnHook.sol";
 import {IStakedIMD} from "../src/interfaces/IStakedIMD.sol";
 
 /// @notice Deploys the recorder, a 48h TimelockController controlled by `ADMIN` (use a multisig), and
-/// Wallstrike owned by that timelock. Fees go to `FEE_RECIPIENT`.
+/// Wallstrike owned by that timelock. Fees go to `FEE_RECIPIENT`; `GUARDIAN` can pause at once.
 ///
-///   ADMIN=0x... FEE_RECIPIENT=0x... forge script script/Deploy.s.sol --rpc-url $MAINNET_RPC_URL \
+///   ADMIN=0x... FEE_RECIPIENT=0x... GUARDIAN=0x... forge script script/Deploy.s.sol --rpc-url $MAINNET_RPC_URL \
 ///     --account deployer --broadcast --verify
 contract Deploy is Script {
     IERC20 internal constant IMD = IERC20(0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7);
@@ -27,13 +27,14 @@ contract Deploy is Script {
     function run() external returns (ImdPriceRecorder recorder, TimelockController timelock, Wallstrike ws) {
         address admin = vm.envAddress("ADMIN");
         address feeRecipient = vm.envAddress("FEE_RECIPIENT");
+        address guardian = vm.envAddress("GUARDIAN");
         address[] memory admins = new address[](1);
         admins[0] = admin;
 
         vm.startBroadcast();
         recorder = new ImdPriceRecorder(HOOK, MANAGER, SIMD, MAIN_POOL);
         timelock = new TimelockController(TIMELOCK_DELAY, admins, admins, address(0));
-        ws = new Wallstrike(IMD, SIMD, HOOK, recorder, address(timelock), feeRecipient);
+        ws = new Wallstrike(IMD, SIMD, HOOK, recorder, address(timelock), feeRecipient, guardian);
         recorder.poke();
         vm.stopBroadcast();
 

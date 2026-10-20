@@ -63,16 +63,15 @@ contract ImdPriceRecorderTest is BaseTest {
         recorder.meanTick(336, 1);
     }
 
-    function test_MedianWallTick() public {
-        int24[5] memory walls = [int24(64_000), 63_000, 65_000, 63_500, 64_500];
+    function test_LowWallTickIsTheTwentyFifthPercentile() public {
+        int24[8] memory walls = [int24(64_000), 63_000, 65_000, 63_500, 64_500, 70_000, 70_000, 70_000];
         for (uint256 i; i < walls.length; ++i) {
             setMarket(SPOT_TICK, SPOT_TICK, walls[i]);
             seed(1);
         }
-        assertEq(recorder.medianWallTick(5, 5), 64_000);
-        setMarket(SPOT_TICK, SPOT_TICK, 70_000);
-        seed(1);
-        assertEq(recorder.medianWallTick(6, 6), 64_500); // even count: the higher middle tick
+        // Sorted: 63000, 63500, 64000, 64500, 65000, 70000 x3. Index 8 / 4 = 2.
+        assertEq(recorder.lowWallTick(8, 8), 64_000);
+        assertEq(recorder.lowWallTick(5, 5), 64_500); // newest five: 63500, 64500, 70000 x3; index 1
     }
 
     function test_RecentSimdRateGoesStale() public {

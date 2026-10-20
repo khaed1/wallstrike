@@ -42,7 +42,7 @@ abstract contract BaseTest is Test {
         recorder = new ImdPriceRecorder(
             ICappedBurnHook(address(hook)), IPoolManager(address(manager)), IStakedIMD(address(simd)), MAIN_POOL
         );
-        ws = new Wallstrike(IERC20(address(imd)), IStakedIMD(address(simd)), ICappedBurnHook(address(hook)), recorder, owner, feeTo);
+        ws = new Wallstrike(IERC20(address(imd)), IStakedIMD(address(simd)), ICappedBurnHook(address(hook)), recorder, owner, feeTo, address(0));
 
         // sIMD worth about 8 IMD per 1e24 shares, like mainnet.
         imd.mint(address(this), 1_000_000e18);

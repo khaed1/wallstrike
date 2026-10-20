@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Status** | Built and tested, not deployed. Unit, fuzz and mainnet-fork tests pass. Not audited. |
+| **Status** | Built and tested, not deployed. Unit, fuzz and mainnet-fork tests pass. An internal adversarial review found two confirmed issues (deposit squatting, repaid-loan capacity) and several pricing and liveness issues; all are fixed and covered by tests. Not externally audited. |
 | **Chain** | Ethereum mainnet only: sIMD exists only there. |
 | **Token** | None. Fees are paid in ETH. |
 
@@ -32,13 +32,13 @@ then     finalize, claim           writers split the ETH, IMD and sIMD left, pro
 | 0 | 80% of the 7-day mean price, lowered to the buy wall if the wall is cheaper |
 | 1 | 60% of the 7-day mean price, lowered to the buy wall if the wall is cheaper |
 
-Tenors are 7 and 30 days from the end of the auction. "The buy wall" is the top of POOL4's ETH backstop band (its 24-hour median), so the strike is normally no higher than where IMD's own protocol would buy. A wall at or above the market (being filled) is ignored, and a wall more than 50% below the market counts as 50% below, so pushing the wall around can never block a series.
+Tenors are 7 and 30 days from the end of the auction. "The buy wall" is the top of POOL4's ETH backstop band. Wallstrike reads it as its 24-hour 25th percentile toward the higher price, so a move has to be held for 18 hours to count. The wall can lower a line's strike by at most 20%, and a wall at or above the market (being filled) is ignored, so pushing the wall around can neither block a series nor drag its strike far down.
 
 **Exit Tickets** are ERC-1155 tokens (id = series id, amount = IMD in wei). After expiry the holder delivers that much IMD, or `sIMD.previewWithdraw(amount)` sIMD shares, and receives `amount × strike` ETH. Tickets are transferable.
 
 **Floor Loans.** A borrower posts sIMD and receives 35% of its IMD value, priced at the lower of the strike and the current price. The fee, taken upfront, is the larger of 3% and the value of the put the loan embeds (struck at the principal). There is no price liquidation. The borrower repays the principal before the exercise window closes and gets the sIMD back, or keeps the ETH and the writers keep the sIMD. Collateral is valued at the lower of sIMD's live rate and its rate at opening plus 1%, so a same-transaction donation cannot inflate a loan.
 
-**Premiums** sell in a one-day Dutch auction from twice a floor down to the floor. The floor is a Black-Scholes put value, re-priced at every sale from the lower of POOL4's `refTick` price and the main pool's live price over the time left to expiry, and never below the floor computed at opening. A fall during the deposit window or the auction is therefore always charged for, and pushing the main pool up does nothing. Pricing volatility is the larger of 200% and 125% of the recorder's 7-day realized volatility; realized IMD/ETH volatility has been 178-391%.
+**Premiums** sell in a one-day Dutch auction from twice a floor down to the floor. The floor is a Black-Scholes put value, re-priced at every sale from the lower of POOL4's `refTick` price and the main pool's live price over the time left until the exercise window closes (holders choose when to exercise within it), and never below the floor computed at opening. A fall during the deposit window or the auction is therefore always charged for, and pushing the main pool up does nothing. Pricing volatility is the larger of 200% and 125% of the recorder's 7-day realized volatility; realized IMD/ETH volatility has been 178-391%.
 
 **Writers** deposit ETH into a series before its auction, with no first-come limit. If deposits exceed the series cap, every writer is put at risk pro rata and the excess comes back after the auction, together with any capacity no ticket or open loan used. After the exercise window, each writer takes a pro rata share of the remaining ETH, the delivered IMD and sIMD, and the sIMD of unpaid loans. Fees, loan-to-value, the cap and the pricing volatility are fixed per series when it opens.
 
@@ -46,17 +46,17 @@ Tenors are 7 and 30 days from the end of the auction. "The buy wall" is the top 
 
 No usable IMD price average exists on-chain: neither POOL4 nor the main ETH/IMD pool keeps price observations, and the IMD Uniswap v3 pools have an observation cardinality of 1. [`ImdPriceRecorder`](src/ImdPriceRecorder.sol) builds one. Every 30 minutes anyone can record a sample of:
 
-- POOL4's `refTick`: the hook's rate-limited follower of the previous swap block's closing tick. A transaction cannot move it, and it moves at most `maxRefStep` (200) ticks per update.
+- POOL4's `refTick`: the hook's rate-limited follower of the closing tick of the previous block that swapped in POOL4. The first POOL4 swap of a block updates it, but only toward that earlier close and by at most `maxRefStep` (200) ticks, so no transaction can set the value it reads.
 - The top of POOL4's buy wall (`backstop().tickLower`).
 - sIMD's rate (`convertToAssets(1e24)`).
 
 A sample counts only if POOL4 is open, funded and rebalancing, `maxRefStep` is at most 200, and `refTick` is within 400 ticks (about 4%) of the main hookless pool's tick. A valid sample cannot be overwritten; an invalid one can be replaced by a later valid one in the same slot.
 
-A series needs 302 valid samples in the last 7 days (280 consecutive pairs for the volatility) and 43 in the last 24 hours. Sales and loans read the live pessimistic price directly, so they do not depend on the keeper. The recorder has no owner and no parameters.
+A series needs 252 valid samples in the last 7 days (200 consecutive pairs for the volatility) and 36 in the last 24 hours, 75% coverage in both, so a keeper outage costs at most a day or two. Sales and loans read the live pessimistic price directly, so they do not depend on the keeper. The recorder has no owner and no parameters.
 
 ## What the owner can and cannot do
 
-The deploy script makes a 48-hour `TimelockController`, controlled by `ADMIN` (use a multisig), the owner. The owner can:
+The deploy script makes a 48-hour `TimelockController`, controlled by `ADMIN` (use a multisig), the owner, and sets `GUARDIAN` (a fast-response address) as the guardian. The owner can:
 
 - set caps for new deposits, tickets and loans
 - set the protocol fee (up to 20%), the loan fee (up to 10%), the loan-to-value (up to 50%) and the volatility floor (100-500%), for series opened afterwards
@@ -85,6 +85,7 @@ All verified on mainnet on 2026-10-20.
 - **Writers carry real tail risk.** In a crash they receive IMD or sIMD at the strike and can exit only into thin pools. Premiums are the only cushion.
 - **POOL4 is controlled by one EOA.** If it closes the market, disables rebalancing or loosens `refTick`'s rate limit, samples become invalid and no new series opens. Open series are unaffected, since they need no price.
 - **Thin markets.** The 7-day mean and the wall can still be nudged at a cost, and a buyer with a loose `maxPremium` can be sandwiched by someone moving the main pool; caps keep the value at stake small, and front ends should quote `premiumRate` and pass a tight `maxPremium`.
+- **Known limits.** Per-account caps can be split across addresses; the global caps are what bound exposure. Delivered IMD and sIMD stay in the contract until the exercise window closes. sIMD paid out by `repay` or `claim` in a block where someone stamped Wallstrike's balance cannot be redeemed until the next block.
 - **Keepers.** The recorder needs a sample every 30 minutes and finished series should be finalized promptly, since open exposure counts against the global caps until then. Both calls are permissionless.
 - **Not audited.** Do not deploy with more than the launch caps before an external audit.
 - **Legal.** Options and loans are regulated in many places. Get advice before launching.
@@ -95,7 +96,7 @@ All verified on mainnet on 2026-10-20.
 forge build
 forge test                                                       # unit and fuzz tests
 MAINNET_RPC_URL=https://... forge test --mc ForkTest -vv         # against the real IMD contracts
-ADMIN=0x... FEE_RECIPIENT=0x... forge script script/Deploy.s.sol \
+ADMIN=0x... FEE_RECIPIENT=0x... GUARDIAN=0x... forge script script/Deploy.s.sol \
   --rpc-url $MAINNET_RPC_URL --account deployer --broadcast --verify
 RPC_URL=https://... RECORDER=0x... KEEPER_ACCOUNT=keeper ./script/keeper.sh   # every few minutes
 ```

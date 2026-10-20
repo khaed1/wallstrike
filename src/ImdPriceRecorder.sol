@@ -11,11 +11,12 @@ import {IStakedIMD} from "./interfaces/IStakedIMD.sol";
 /// @title ImdPriceRecorder
 /// @notice Builds the IMD price history that no on-chain source provides. Every 30 minutes anyone can
 /// record one sample: POOL4's lagged reference tick, the top of POOL4's buy wall, and the sIMD exchange
-/// rate. A sample counts only if POOL4 is healthy and its reference tick agrees with the main hookless
-/// ETH/IMD pool, so moving one pool alone cannot produce a counted sample.
-/// @dev Ticks are log_1.0001(IMD per ETH): a higher tick means cheaper IMD. `refTick` cannot be moved
-/// inside a transaction and moves at most `maxRefStep` ticks per update, which is what makes the means
-/// below expensive to push. No owner, no parameters.
+/// rate. A sample counts only if POOL4 is healthy and its reference tick is within 400 ticks of the main
+/// hookless ETH/IMD pool, so moving one pool alone cannot produce a counted sample.
+/// @dev Ticks are log_1.0001(IMD per ETH): a higher tick means cheaper IMD. `refTick` follows the closing
+/// tick of the previous block that swapped in POOL4: the first POOL4 swap of a block updates it, but only
+/// toward that earlier close and by at most `maxRefStep` ticks, so no transaction can set the value it
+/// reads. That is what makes the means below expensive to push. No owner, no parameters.
 contract ImdPriceRecorder {
     using StateLibrary for IPoolManager;
 
@@ -101,9 +102,10 @@ contract ImdPriceRecorder {
         return int24(mean);
     }
 
-    /// @notice Median of the buy wall's top tick over the valid samples of the last `slots` slots.
-    /// For an even count it returns the higher of the two middle ticks (the cheaper IMD price).
-    function medianWallTick(uint256 slots, uint256 minValid) external view returns (int24) {
+    /// @notice 25th percentile of the buy wall's top tick over the valid samples of the last `slots` slots,
+    /// counted from the lowest tick (the highest IMD price). Moving it toward cheaper IMD takes a wall held
+    /// there for three quarters of the window.
+    function lowWallTick(uint256 slots, uint256 minValid) external view returns (int24) {
         uint32 current = _currentSlot();
         int24[] memory ticks = new int24[](slots);
         uint256 count;
@@ -121,7 +123,7 @@ contract ImdPriceRecorder {
             }
             ticks[j] = key;
         }
-        return ticks[count / 2];
+        return ticks[count / 4];
     }
 
     /// @notice Annualized volatility (1e18 = 100%) of refTick across consecutive valid samples in the last

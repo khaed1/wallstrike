@@ -47,12 +47,12 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
 
     // --- price windows (30-minute recorder slots) ---
     uint256 public constant MEAN_SLOTS = 336; // 7 days
-    uint256 public constant MEAN_MIN_VALID = 302;
-    uint256 public constant VOL_MIN_PAIRS = 280;
+    uint256 public constant MEAN_MIN_VALID = 252; // 75%
+    uint256 public constant VOL_MIN_PAIRS = 200;
     uint256 public constant SPOT_SLOTS = 48; // 24 hours
-    uint256 public constant SPOT_MIN_VALID = 43;
-    /// @notice The wall caps the strike at most 50% below the 24h mean price (ln 2 / ln 1.0001 ticks).
-    int24 public constant MAX_WALL_DISCOUNT = 6932;
+    uint256 public constant SPOT_MIN_VALID = 36; // 75%
+    /// @notice The wall can lower a line's strike by at most 20% (2232 ticks).
+    int256 public constant MAX_WALL_BELOW_LINE = 2232;
     /// @notice Pricing volatility is at least 125% of the 7-day realized volatility of refTick.
     uint256 public constant VOL_MARKUP_BPS = 12_500;
 
@@ -183,7 +183,8 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         ICappedBurnHook hook_,
         ImdPriceRecorder recorder_,
         address owner_,
-        address feeRecipient_
+        address feeRecipient_,
+        address guardian_
     ) ERC1155("") Ownable(owner_) {
         if (simd_.asset() != address(imd_) || address(recorder_.hook()) != address(hook_)) revert InvalidSetting();
         if (address(recorder_.simd()) != address(simd_) || feeRecipient_ == address(0)) revert InvalidSetting();
@@ -192,6 +193,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         hook = hook_;
         recorder = recorder_;
         feeRecipient = feeRecipient_;
+        guardian = guardian_;
     }
 
     // ------------------------------------------------------------------
@@ -211,7 +213,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         (uint256 strike, uint256 spot) = _strikeAndSpot(line);
         uint256 sigma = Math.max(sigmaFloor, recorder.realizedVol(MEAN_SLOTS, VOL_MIN_PAIRS) * VOL_MARKUP_BPS / 10_000);
         uint256 tenor = tenorSeconds(tenorId);
-        uint256 floorRate = OptionMath.putRate(spot, strike, sigma, tenor + AUCTION);
+        uint256 floorRate = OptionMath.putRate(spot, strike, sigma, tenor + AUCTION + EXERCISE_WINDOW);
 
         id = ++seriesCount;
         seriesByKey[key] = id;
@@ -237,18 +239,20 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         return _strikeAndSpot(line);
     }
 
-    /// @dev The line's strike, lowered to the buy wall's 24h median when the wall sits between the market
-    /// and 50% below it. A wall at or above the market (being filled) is ignored, and a wall further down is
-    /// treated as 50% below, so moving the wall can never block a series.
+    /// @dev The line's strike, lowered to the buy wall when the wall sits below the market and below the
+    /// line, by at most 20%. The wall reading is its 24h 25th percentile toward the higher price, so it has to
+    /// be held for 18 hours to count. A wall at or above the market (being filled) is ignored. Moving the wall
+    /// can therefore never block a series, and lowers a strike by 20% at most.
     function _strikeAndSpot(uint8 line) internal view returns (uint256 strike, uint256 spot) {
         int24 meanTick = recorder.meanTick(MEAN_SLOTS, MEAN_MIN_VALID);
         int24 spotTick = recorder.meanTick(SPOT_SLOTS, SPOT_MIN_VALID);
-        int24 wallTick = recorder.medianWallTick(SPOT_SLOTS, SPOT_MIN_VALID);
+        int24 wallTick = recorder.lowWallTick(SPOT_SLOTS, SPOT_MIN_VALID);
         // A higher tick is a lower IMD price, so the larger tick is the lower strike.
-        int256 strikeTick = int256(meanTick) + lineOffset(line);
-        if (wallTick > spotTick) {
-            int256 wall = int256(wallTick) - spotTick > MAX_WALL_DISCOUNT ? int256(spotTick) + MAX_WALL_DISCOUNT : wallTick;
-            if (wall > strikeTick) strikeTick = wall;
+        int256 lineTick = int256(meanTick) + lineOffset(line);
+        int256 strikeTick = lineTick;
+        if (wallTick > spotTick && wallTick > lineTick) {
+            int256 lowest = lineTick + MAX_WALL_BELOW_LINE;
+            strikeTick = wallTick < lowest ? wallTick : lowest;
         }
         if (strikeTick > TickMath.MAX_TICK) strikeTick = TickMath.MAX_TICK;
         strike = TickPrice.ethPerImd(int24(strikeTick));
@@ -266,12 +270,14 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
 
     /// @notice Premium rate (fraction of strike notional) now: twice the floor at the start of the auction,
     /// falling linearly to the floor at its end. The floor is the larger of the floor at opening and the
-    /// put's value at the current pessimistic price over the time left to expiry.
+    /// put's value at the current pessimistic price until the exercise window closes (holders can pick when
+    /// to exercise within it).
     function premiumRate(uint256 id) public view returns (uint256) {
         Series storage s = _series(id);
         _requireAuction(s);
         uint256 spot = TickPrice.ethPerImd(recorder.pessimisticTick());
-        uint256 floorRate = Math.max(s.floorRate, OptionMath.putRate(spot, s.strike, s.sigma, s.expiry - block.timestamp));
+        uint256 floorRate =
+            Math.max(s.floorRate, OptionMath.putRate(spot, s.strike, s.sigma, s.expiry + EXERCISE_WINDOW - block.timestamp));
         uint256 remaining = s.auctionStart + AUCTION - block.timestamp;
         return floorRate + Math.mulDiv(floorRate, remaining, AUCTION);
     }

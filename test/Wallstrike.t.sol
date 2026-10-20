@@ -75,12 +75,20 @@ contract WallstrikeTest is BaseTest {
         assertEq(ws.getSeries(id).strike, TickPrice.ethPerImd(SPOT_TICK + 2232)); // 80% of the mean
     }
 
-    function test_WallFarBelowTheMarketCountsAsFiftyPercentBelow() public {
+    /// @dev Review finding: holding the wall far down for half a day forced a degraded strike.
+    function test_WallLowersAStrikeByAtMostTwentyPercent() public {
         setMarket(SPOT_TICK, SPOT_TICK, SPOT_TICK + 20_000); // pushed far down
         seed(48);
         uint256 id = ws.openSeries(0, 0);
-        assertEq(ws.getSeries(id).strike, TickPrice.ethPerImd(SPOT_TICK + 6932));
-        assertApproxEqRel(ws.getSeries(id).strike, TickPrice.ethPerImd(SPOT_TICK) / 2, 1e14);
+        assertEq(ws.getSeries(id).strike, TickPrice.ethPerImd(SPOT_TICK + 2232 + 2232));
+        assertApproxEqRel(ws.getSeries(id).strike, TickPrice.ethPerImd(SPOT_TICK) * 64 / 100, 1e14);
+    }
+
+    function test_WallMoveHeldForHalfADayDoesNotCount() public {
+        setMarket(SPOT_TICK, SPOT_TICK, SPOT_TICK + 5000);
+        seed(24); // 12 of the last 24 hours
+        uint256 id = ws.openSeries(0, 0);
+        assertEq(ws.getSeries(id).strike, TickPrice.ethPerImd(WALL_TICK));
     }
 
     function test_ShortLivedWallMoveDoesNotMoveTheStrike() public {
