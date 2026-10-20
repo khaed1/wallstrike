@@ -8,11 +8,96 @@
 | **Chain** | Ethereum mainnet only: sIMD exists only there. |
 | **Token** | None. Fees are paid in ETH. |
 
-## Why
+## In plain words
 
-IMD's on-chain exit liquidity is thin. On 2026-10-20, Ethereum pools could absorb only about 40 ETH of IMD sells within a 20% price drop, while sIMD held about 1.89M IMD (about $8.6M). A large holder who sells into that depth loses heavily to slippage, and when several try at once it becomes a run. Wallstrike lets them reserve an exit price in advance from ETH holders who want IMD at a discount and are paid a premium to wait.
+Wallstrike lets IMD holders **book a guaranteed selling price in advance**, paid in ETH, from people who are happy to buy IMD if it gets cheap. It works like insurance on your IMD: you pay a small fee now, and if the price crashes you can still sell at the agreed price.
 
-## How it works
+The dollar figures below are illustrative, using IMD at about $5 and ETH at about $2,400.
+
+### The problem it solves
+
+IMD's markets are thin. On 2026-10-20, Ethereum pools could absorb only about 40 ETH (about $95k) of IMD sells before the price dropped 20%, while sIMD held about 1.89M IMD (about $8.6M). So if you hold, say, $100k of IMD:
+
+- selling it all at once would crash the price by itself;
+- when bad news hits, every big holder rushes to sell first, and whoever is last gets the worst price. That's a run.
+
+Wallstrike gives those holders a pre-booked exit, so they don't have to race.
+
+### What "strike" means
+
+**The strike is the guaranteed selling price.** If you hold an Exit Ticket with a strike of $4, you can sell your IMD for $4 each at expiry, however low the market has fallen.
+
+Each weekly series has its strike calculated automatically when it opens, at one of two levels:
+
+- **Line 0:** 80% of IMD's average price over the last 7 days.
+- **Line 1:** 60% of that average.
+
+The strike can also be lowered toward POOL4's buy wall (where IMD's own pool keeps ETH ready to buy back IMD), but by at most 20%. With IMD around $5, line 0's strike sits at about $4.
+
+A higher strike gives more protection and costs more. A lower strike is cheaper but only protects you in a deep crash. The strike is fixed in ETH per IMD, not in dollars; "$4" is just its value today.
+
+### The three kinds of users
+
+**1. IMD holders who want protection buy an Exit Ticket.** You pay a fee (the *premium*) upfront. In return you hold the right, after the expiry date, to sell your IMD at the strike.
+
+Example: you hold 1,000 IMD, the strike is $4, and a 7-day ticket costs about 4.7% of $4,000, roughly $190. It costs up to twice that if you buy early in the one-day sale.
+
+| IMD price at expiry | What you do | Result |
+|---|---|---|
+| $6 | Nothing; the ticket expires | You lose the $190, but your IMD is worth $6,000 |
+| $4 | Nothing; same as the market | You lose the $190 |
+| $2 | Exercise: hand over 1,000 IMD, receive $4,000 in ETH | Without the ticket you'd get under $2,000, less after slippage. You saved over $2,000 for $190 |
+
+It works like house insurance: you pay a little each period, and it only matters on the bad day.
+
+**2. sIMD stakers who need cash take a Floor Loan.** You want ETH but don't want to sell or unstake. You post your sIMD and borrow ETH against it.
+
+Example: sIMD worth 1,000 IMD.
+
+- You borrow 35% of its value at the strike: 35% × $4,000 = $1,400 (about 0.59 ETH).
+- The fee is about 3%, taken upfront, so you receive about $1,358.
+- Repay $1,400 before the deadline and you get your sIMD back.
+
+What makes it different from normal crypto loans is that there is **no liquidation**. If IMD crashes and your sIMD falls to $1,000, nobody force-sells it. You choose: repay and take your sIMD back, or walk away, keep the $1,358, and let the lenders keep the sIMD.
+
+**3. ETH holders who want IMD cheaper become writers.** Writers are the other side of every ticket and loan. You deposit ETH into a series and earn the premiums and loan fees.
+
+Your risk: if IMD crashes, ticket holders sell you their IMD at the strike, so you end up owning IMD bought at $4 while the market says $2. It's like being paid to keep a buy order open below the market:
+
+- **If the price holds,** you get your ETH back plus fees after about 10 days (for a 7-day series).
+- **If it crashes,** you end up buying IMD at the strike, a discount to where it was a week earlier, and you keep the premiums.
+
+ETH that no buyer used comes back to you right after the one-day sale.
+
+### A week, step by step
+
+1. **Any day of the week, a series opens.** Anyone can open it. The strike is calculated and locked.
+2. **Day 1: writers deposit ETH.** They can still withdraw.
+3. **Day 2: the sale.** Holders buy tickets and stakers take loans. Ticket prices start at double and fall over the day.
+4. **About a week later (or 30 days for 30-day series): expiry.** For the next 3 days:
+    - ticket holders can exercise (deliver IMD, receive ETH);
+    - borrowers can repay.
+5. **Settlement:** writers collect what's left: ETH, plus any IMD or sIMD that was delivered or left behind by unpaid loans.
+
+### What everyone gets
+
+| Who | Gets | Gives up |
+|---|---|---|
+| IMD holder (ticket) | A guaranteed exit price; no need to panic-sell | The premium |
+| sIMD staker (loan) | ETH now, stays staked, no liquidation risk | A fee, plus the sIMD if they don't repay |
+| ETH holder (writer) | Premium and fee income; IMD at a discount if it drops | Risk of buying IMD above the market in a crash |
+| The protocol (fee recipient) | 10% of all premiums and loan fees, in ETH | Running the keeper; audit and legal costs |
+| IMD itself | Fewer panic dumps, a new use for sIMD, and ETH buyers waiting below the market | – |
+
+### Why it fits IMD
+
+- It uses **POOL4's buy wall** as a reference for where strikes sit.
+- It gives **sIMD** a new job, as loan collateral and as a way to settle tickets.
+- It turns IMD's biggest weakness, thin liquidity that makes big exits painful, into the thing people pay for.
+
+That's the Olympus (3,3) idea applied to exits. With a pre-booked exit, rushing to sell first stops being the smart move, so the run doesn't start.
+
+## How it works, in detail
 
 ```
 week N   openSeries(line, tenor)   strike fixed from the recorder, never read again
