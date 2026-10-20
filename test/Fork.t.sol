@@ -7,6 +7,7 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {PoolId} from "v4-core/types/PoolId.sol";
 import {ImdPriceRecorder} from "../src/ImdPriceRecorder.sol";
 import {Wallstrike} from "../src/Wallstrike.sol";
+import {WriterVault} from "../src/WriterVault.sol";
 import {ICappedBurnHook} from "../src/interfaces/ICappedBurnHook.sol";
 import {IStakedIMD} from "../src/interfaces/IStakedIMD.sol";
 import {TickPrice} from "../src/libraries/TickPrice.sol";
@@ -111,5 +112,43 @@ contract ForkTest is Test {
         assertGt(eth, 0);
         assertEq(loanId, 1);
         assertLe(address(ws).balance, ws.feesAccrued() + 5);
+    }
+
+    function test_Fork_VaultRoundOnRealContracts() public {
+        if (!live) return;
+        for (uint256 i; i < 340; ++i) {
+            vm.warp(block.timestamp + 30 minutes);
+            vm.roll(block.number + 150);
+            recorder.poke();
+        }
+        WriterVault vault = new WriterVault(ws, 0, 0);
+        vm.prank(writer);
+        vault.deposit{value: 4 ether}();
+        uint256 id = vault.startRound();
+        Wallstrike.Series memory s = ws.getSeries(id);
+
+        vm.warp(s.auctionStart);
+        recorder.poke();
+        vm.prank(buyer);
+        ws.buyTickets{value: 5 ether}(id, 1000e18, 5 ether, 0);
+
+        vm.warp(s.expiry);
+        deal(address(IMD), buyer, 1000e18);
+        vm.startPrank(buyer);
+        IMD.approve(address(ws), 1000e18);
+        ws.exercise(id, 1000e18, false);
+        vm.stopPrank();
+
+        vm.warp(uint256(s.expiry) + ws.EXERCISE_WINDOW());
+        vault.endRound();
+        vm.prank(writer);
+        (, uint256 imdOut,) = vault.claim();
+        uint256 shares = vault.accountOf(writer).shares;
+        console2.log("vault ETH per writer after the round (wei)", vault.previewWithdraw(shares));
+        console2.log("IMD delivered to the writer", imdOut);
+        assertApproxEqAbs(imdOut, 1000e18, 1e10);
+        vm.prank(writer);
+        vault.withdraw(shares);
+        assertLe(address(vault).balance, 1e9);
     }
 }

@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Status** | Built and tested, not deployed. Unit, fuzz and mainnet-fork tests pass. An internal adversarial review found two confirmed issues (deposit squatting, repaid-loan capacity) and several pricing and liveness issues; all are fixed and covered by tests. Not externally audited. |
+| **Status** | Built and tested, not deployed. Unit, fuzz and mainnet-fork tests pass. An internal adversarial review of the core contracts found two confirmed issues (deposit squatting, repaid-loan capacity) and several pricing and liveness issues; all are fixed and covered by tests. Not externally audited. |
 | **Chain** | Ethereum mainnet only: sIMD exists only there. |
 | **Token** | None. Fees are paid in ETH. |
 
@@ -69,6 +69,8 @@ Your risk: if IMD crashes, ticket holders sell you their IMD at the strike, so y
 
 ETH that no buyer used comes back to you right after the one-day sale.
 
+Writers who don't want to come back every week can use a **writer vault** instead: deposit ETH once and the vault writes every round for you (see [Writer vaults](#writer-vaults)).
+
 ### A week, step by step
 
 1. **Any day of the week, a series opens.** Anyone can open it. The strike is calculated and locked.
@@ -95,7 +97,71 @@ ETH that no buyer used comes back to you right after the one-day sale.
 - It gives **sIMD** a new job, as loan collateral and as a way to settle tickets.
 - It turns IMD's biggest weakness, thin liquidity that makes big exits painful, into the thing people pay for.
 
-That's the Olympus (3,3) idea applied to exits. With a pre-booked exit, rushing to sell first stops being the smart move, so the run doesn't start.
+That's the Olympus (3,3) idea applied to exits. With a pre-booked exit, rushing to sell first stops being the smart move, so the run doesn't start. The next section shows why.
+
+## The (3,3) game
+
+The original (3,3) from Olympus is a game between two holders who each choose to **stake** (hold) or **sell**. If both stake, both win: (3,3). If one sells, the seller does fine and the holder is hurt. If both sell, it crashes: (−3,−3). The trouble is that once you suspect the other side will sell, selling first becomes your best move. So fear alone can start a run, and that is what broke Olympus.
+
+Wallstrike adds a third choice: **reserve an exit** (buy an Exit Ticket). Here is the game for two big IMD holders during a scare. Numbers are each player's change over 30 days, in percent, and are illustrative:
+
+| | Other **holds** | Other **reserves** | Other **dumps** |
+|---|---|---|---|
+| **You hold** | (0, 0) | (0, −2) | (−35, −16) |
+| **You reserve** | (−2, 0) | (−2, −2) | (−20, −16) |
+| **You dump** | (−16, −35) | (−16, −20) | (−25, −25): the run |
+
+- **Without Wallstrike**, only "hold" and "dump" exist. If the other side dumps, dumping too (−25) beats holding (−35), so a run can start from fear alone.
+- **With Wallstrike**, "reserve" beats "dump" whatever the other side does (−2 > −16, −2 > −16, −20 > −25). Paying about 2% guarantees an exit price, far cheaper than the slippage of selling into thin pools in a panic. The run stops being the best move, so it doesn't start.
+
+The difference from Olympus: Olympus paid people to stay with newly minted tokens. Wallstrike removes the reason to leave first, and the people who pay for it are the insured holders themselves. No emissions are needed. The effect only reaches as far as the capacity, though: at launch caps (25 ETH of tickets) it protects a few large holders, not the whole IMD market.
+
+## How TVL grows
+
+TVL here is the writer ETH at risk in series (including through writer vaults) plus the sIMD posted for Floor Loans. Writers only stay if their return beats their risk, so TVL follows this loop:
+
+```
+more holders want protection -> more premiums -> higher writer return -> more writer ETH
+        ^                                                                        |
+        +---- bigger caps, more strikes and tenors, a deeper IMD market <--------+
+```
+
+**Where writers' return comes from.** At 2026-10-20 prices a 7-day ticket costs 4.7-9.4% of strike notional, depending on when in the auction it sells. With half of a series' capacity used, writers earn roughly 2-4% a week before losses; in crash weeks they buy IMD above the market, which is the loss side. Their edge over fair value comes from the auction starting at twice the floor, the 25% volatility markup and the floor itself. It works best for writers who wanted IMD at a lower price anyway.
+
+**What limits TVL:**
+
+1. **Caps, kept small on purpose:** 10 ETH per series, 25 ETH of tickets in total, 10 ETH of loans. Deposits above a series cap are accepted but returned after the auction, so they are not real TVL. Caps rise through the 48-hour timelock, and should rise only after an audit and as IMD liquidity deepens.
+2. **Manual deposits every week.** Writer vaults remove this: deposit once, and the vault rolls into every round.
+3. **Idle ETH earns nothing** between sales.
+4. **Demand can't outgrow IMD.** sIMD holds about $8.6M and exit depth is about $95k. A hedging market much bigger than its underlying won't fill.
+
+**What would grow it, roughly in order of impact:**
+
+1. **Writer vaults.** Built: see below. TVL stays from round to round instead of having to be won back every week, the way the Ribbon and Thetanuts option vaults grew.
+2. **Caps that follow a rule**, for example open tickets as a set share of measured exit depth, so capacity grows automatically as IMD's market deepens.
+3. **Yield on idle writer capital**, for example accepting wstETH so waiting ETH earns staking yield. That raises writer returns without raising risk.
+4. **Floor Loans as a reason to stay staked.** Getting ETH without unstaking makes sIMD better to hold, and posted sIMD counts as TVL too.
+5. **Partners.** IMD's own team could put buy-wall ETH to work writing tickets, and seat holders could insure their income. Both need IMD's cooperation.
+
+**What to avoid:** launching a token to pay writers emissions. TVL would grow fast and leave faster, and it brings back the run problem Wallstrike exists to solve. If a token comes later, its safer job is backstop staking (holders cover writers' losses in exchange for fees), funded by real fee revenue.
+
+## Writer vaults
+
+[`WriterVault`](src/WriterVault.sol) writes one product (a strike line and a tenor) for its depositors, round after round. The deploy script creates two: **weekly** (line 0, 7-day series) and **monthly** (line 1, 30-day series).
+
+```
+deposit()      ETH waits for the next round
+startRound()   anyone: joins this week's series (opening it if needed), deposits all the vault's ETH
+               ... the series runs: auction, expiry, exercise window ...
+endRound()     anyone: collects the series' ETH, IMD and sIMD; pays queued withdrawals
+startRound()   the next week a series is open: the same shares roll into it automatically
+```
+
+- **One series at a time.** A 7-day series takes 12 days from opening to settlement, so the weekly vault runs a round every two weeks; the monthly vault about every five.
+- **Shares are priced only between rounds**, when the vault holds nothing but ETH, so no price oracle is involved. Deposits always wait for the next round and become shares at its starting price, and can be cancelled until then.
+- **Withdrawals** are instant between rounds. During a round the shares stay at risk and their ETH is paid at the round's closing price; claim it with `claim()`.
+- **IMD and sIMD** that the vault receives (exercised tickets, unpaid loans) are not part of the share price. They are split among that round's shareholders pro rata and claimed with `claim()`, so writers get the discounted IMD they signed up for. Depositors who join later get none of an earlier round's IMD.
+- **No owner, no fee.** `startRound` and `endRound` are permissionless; the keeper script calls them. Shares are not transferable in this version.
 
 ## How it works, in detail
 
@@ -171,7 +237,7 @@ All verified on mainnet on 2026-10-20.
 - **POOL4 is controlled by one EOA.** If it closes the market, disables rebalancing or loosens `refTick`'s rate limit, samples become invalid and no new series opens. Open series are unaffected, since they need no price.
 - **Thin markets.** The 7-day mean and the wall can still be nudged at a cost, and a buyer with a loose `maxPremium` can be sandwiched by someone moving the main pool; caps keep the value at stake small, and front ends should quote `premiumRate` and pass a tight `maxPremium`.
 - **Known limits.** Per-account caps can be split across addresses; the global caps are what bound exposure. Delivered IMD and sIMD stay in the contract until the exercise window closes. sIMD paid out by `repay` or `claim` in a block where someone stamped Wallstrike's balance cannot be redeemed until the next block.
-- **Keepers.** The recorder needs a sample every 30 minutes and finished series should be finalized promptly, since open exposure counts against the global caps until then. Both calls are permissionless.
+- **Keepers.** The recorder needs a sample every 30 minutes, finished series should be finalized promptly (open exposure counts against the global caps until then), and writer vaults need `endRound` and `startRound` called. All of these are permissionless, and `script/keeper.sh` does them.
 - **Not audited.** Do not deploy with more than the launch caps before an external audit.
 - **Legal.** Options and loans are regulated in many places. Get advice before launching.
 
@@ -183,7 +249,7 @@ forge test                                                       # unit and fuzz
 MAINNET_RPC_URL=https://... forge test --mc ForkTest -vv         # against the real IMD contracts
 ADMIN=0x... FEE_RECIPIENT=0x... GUARDIAN=0x... forge script script/Deploy.s.sol \
   --rpc-url $MAINNET_RPC_URL --account deployer --broadcast --verify
-RPC_URL=https://... RECORDER=0x... KEEPER_ACCOUNT=keeper ./script/keeper.sh   # every few minutes
+RPC_URL=https://... RECORDER=0x... VAULTS="0x... 0x..." KEEPER_ACCOUNT=keeper ./script/keeper.sh   # every few minutes
 ```
 
 After deploying, the recorder needs about 7 days of samples before the first series can open.

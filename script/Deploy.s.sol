@@ -8,11 +8,13 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {PoolId} from "v4-core/types/PoolId.sol";
 import {ImdPriceRecorder} from "../src/ImdPriceRecorder.sol";
 import {Wallstrike} from "../src/Wallstrike.sol";
+import {WriterVault} from "../src/WriterVault.sol";
 import {ICappedBurnHook} from "../src/interfaces/ICappedBurnHook.sol";
 import {IStakedIMD} from "../src/interfaces/IStakedIMD.sol";
 
 /// @notice Deploys the recorder, a 48h TimelockController controlled by `ADMIN` (use a multisig), and
-/// Wallstrike owned by that timelock. Fees go to `FEE_RECIPIENT`; `GUARDIAN` can pause at once.
+/// Wallstrike owned by that timelock, plus two auto-rolling writer vaults: weekly at the 80% line and
+/// monthly at the 60% line. Fees go to `FEE_RECIPIENT`; `GUARDIAN` can pause at once.
 ///
 ///   ADMIN=0x... FEE_RECIPIENT=0x... GUARDIAN=0x... forge script script/Deploy.s.sol --rpc-url $MAINNET_RPC_URL \
 ///     --account deployer --broadcast --verify
@@ -24,7 +26,16 @@ contract Deploy is Script {
     PoolId internal constant MAIN_POOL = PoolId.wrap(0xb07d640fd9e2eb9dc81b953c8e4fd006bdfeaf276010fb5418eb763ca15abfb3);
     uint256 internal constant TIMELOCK_DELAY = 48 hours;
 
-    function run() external returns (ImdPriceRecorder recorder, TimelockController timelock, Wallstrike ws) {
+    function run()
+        external
+        returns (
+            ImdPriceRecorder recorder,
+            TimelockController timelock,
+            Wallstrike ws,
+            WriterVault weeklyVault,
+            WriterVault monthlyVault
+        )
+    {
         address admin = vm.envAddress("ADMIN");
         address feeRecipient = vm.envAddress("FEE_RECIPIENT");
         address guardian = vm.envAddress("GUARDIAN");
@@ -35,11 +46,15 @@ contract Deploy is Script {
         recorder = new ImdPriceRecorder(HOOK, MANAGER, SIMD, MAIN_POOL);
         timelock = new TimelockController(TIMELOCK_DELAY, admins, admins, address(0));
         ws = new Wallstrike(IMD, SIMD, HOOK, recorder, address(timelock), feeRecipient, guardian);
+        weeklyVault = new WriterVault(ws, 0, 0);
+        monthlyVault = new WriterVault(ws, 1, 1);
         recorder.poke();
         vm.stopBroadcast();
 
         console2.log("ImdPriceRecorder", address(recorder));
         console2.log("TimelockController", address(timelock));
         console2.log("Wallstrike", address(ws));
+        console2.log("WriterVault weekly (line 0, 7 days)", address(weeklyVault));
+        console2.log("WriterVault monthly (line 1, 30 days)", address(monthlyVault));
     }
 }
