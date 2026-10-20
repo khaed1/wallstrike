@@ -84,4 +84,23 @@ contract ImdPriceRecorderTest is BaseTest {
         vm.expectRevert(ImdPriceRecorder.Stale.selector);
         recorder.recentSimdRate();
     }
+
+    function test_PessimisticTickIsTheCheaperOfRefTickAndMainPool() public {
+        setMarket(SPOT_TICK, SPOT_TICK + 50, WALL_TICK);
+        assertEq(recorder.pessimisticTick(), SPOT_TICK + 50);
+        setMarket(SPOT_TICK + 80, SPOT_TICK, WALL_TICK);
+        assertEq(recorder.pessimisticTick(), SPOT_TICK + 80);
+    }
+
+    function test_RealizedVolSkipsGaps() public {
+        seed(3); // flat: zero volatility
+        assertEq(recorder.realizedVol(3, 2), 0);
+        setMarket(SPOT_TICK + 100, SPOT_TICK + 100, WALL_TICK);
+        vm.warp(block.timestamp + 2 hours); // a gap: no pair spans it
+        seed(1);
+        vm.expectRevert(abi.encodeWithSelector(ImdPriceRecorder.NotEnoughSamples.selector, 0, 1));
+        recorder.realizedVol(2, 1);
+        seed(1);
+        assertEq(recorder.realizedVol(2, 1), 0);
+    }
 }

@@ -19,19 +19,21 @@ import {OptionMath} from "./libraries/OptionMath.sol";
 /// @notice Reserved exits for IMD and sIMD holders.
 ///
 /// Every week anyone can open a series per strike line and tenor. Its strike is fixed at opening from the
-/// 7-day mean price and the top of POOL4's buy wall, and never read again. ETH writers deposit for one
-/// day, then buyers have one day to:
+/// 7-day mean price and the top of POOL4's buy wall. ETH writers deposit for one day, then buyers have one
+/// day to:
 /// - buy Exit Tickets (ERC-1155, id = series id): the right, after expiry, to deliver IMD (or sIMD) and
 ///   receive the strike in ETH; or
 /// - take a Floor Loan: post sIMD, receive ETH, no price liquidation. An unpaid loan's sIMD goes to the
 ///   writers.
-/// Premiums sell in a Dutch auction from twice a Black-Scholes floor down to the floor.
+/// Premiums sell in a Dutch auction from twice a Black-Scholes floor down to the floor. The floor is
+/// re-priced at every sale from the lower of POOL4's refTick price and the main pool's price, so a fall
+/// during the deposit window or the auction is always charged for.
 ///
 /// Every ticket is fully backed by ETH locked at purchase, settlement is physical, and sIMD only ever
 /// moves by transfer (sIMD's one-block hold blocks redeems, never transfers). The owner (intended to be
-/// a timelock) can change caps and fees for new activity and pause new series, deposits, sales and
-/// loans; it can never touch an existing series, ticket, loan or writer balance, and exercise, repay,
-/// finalize and claims always stay open.
+/// a timelock) can change caps and fees for future series and pause new series, deposits, sales and
+/// loans; a guardian can pause at once. Neither can touch an existing series, ticket, loan or writer
+/// balance, and exercise, repay, finalize and claims always stay open.
 contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using SafeERC20 for IStakedIMD;
@@ -46,10 +48,13 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     // --- price windows (30-minute recorder slots) ---
     uint256 public constant MEAN_SLOTS = 336; // 7 days
     uint256 public constant MEAN_MIN_VALID = 302;
+    uint256 public constant VOL_MIN_PAIRS = 280;
     uint256 public constant SPOT_SLOTS = 48; // 24 hours
     uint256 public constant SPOT_MIN_VALID = 43;
-    /// @notice The wall may sit at most 50% below the 24h mean price (ln 2 / ln 1.0001 ticks).
+    /// @notice The wall caps the strike at most 50% below the 24h mean price (ln 2 / ln 1.0001 ticks).
     int24 public constant MAX_WALL_DISCOUNT = 6932;
+    /// @notice Pricing volatility is at least 125% of the 7-day realized volatility of refTick.
+    uint256 public constant VOL_MARKUP_BPS = 12_500;
 
     // --- bounds on owner settings ---
     uint256 public constant MAX_PROTOCOL_FEE_BPS = 2000;
@@ -59,8 +64,8 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     uint256 public constant MAX_SIGMA = 5e18;
     uint256 public constant MIN_FLOOR_RATE = 0.005e18;
     uint256 public constant MAX_FLOOR_RATE = 0.9e18;
-    /// @notice Loans value sIMD at no more than the last recorded rate plus 0.5%.
-    uint256 public constant SIMD_RATE_TOLERANCE_BPS = 50;
+    /// @notice Loans value sIMD at no more than its rate at opening plus 1%.
+    uint256 public constant SIMD_RATE_TOLERANCE_BPS = 100;
 
     struct Series {
         uint64 auctionStart;
@@ -68,14 +73,21 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         uint8 line;
         uint8 tenorId;
         bool finalized;
+        uint16 protocolFeeBps;
+        uint16 loanFeeBps;
+        uint16 loanLtvBps;
         uint256 strike; // wei of ETH per 1e18 IMD
-        uint256 floorRate; // premium floor as a fraction of strike notional, 1e18 = 100%
+        uint256 sigma; // pricing volatility, 1e18 = 100%
+        uint256 floorRate; // premium floor at opening, as a fraction of strike notional
+        uint256 simdRate; // sIMD rate at opening, IMD per 1e24 shares
+        uint256 depositCap; // most writer ETH that can be put at risk; any excess is released
         uint256 deposits; // writer shares, 1 wei of ETH each
         uint256 ticketCollateral; // ETH locked behind sold tickets
         uint256 premiums; // writers' share of premiums
         uint256 loanFees; // writers' share of loan fees
         uint256 loanPrincipal; // ETH lent
         uint256 loanRepaid; // ETH repaid
+        uint256 loanRepaidInAuction; // ETH repaid before the auction ended, released with unused capacity
         uint256 loanCollateral; // sIMD shares held for open loans
         uint256 exercisePaid; // ETH paid to ticket holders
         uint256 imdDelivered;
@@ -112,7 +124,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     uint256 public openTicketCollateral;
     uint256 public openLoanPrincipal;
 
-    // --- owner settings (apply to new activity only) ---
+    // --- owner settings ---
     uint256 public maxSeriesDeposits = 10 ether;
     uint256 public maxAccountCollateral = 2.5 ether;
     uint256 public maxOpenTicketCollateral = 25 ether;
@@ -123,11 +135,19 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     uint256 public protocolFeeBps = 1000;
     uint256 public sigmaFloor = 2e18;
     bool public paused;
+    address public guardian;
     address public feeRecipient;
     uint256 public feesAccrued;
 
     event SeriesOpened(
-        uint256 indexed id, uint8 line, uint8 tenorId, uint256 strike, uint256 floorRate, uint256 auctionStart, uint256 expiry
+        uint256 indexed id,
+        uint8 line,
+        uint8 tenorId,
+        uint256 strike,
+        uint256 sigma,
+        uint256 floorRate,
+        uint256 auctionStart,
+        uint256 expiry
     );
     event Deposited(uint256 indexed id, address indexed writer, uint256 amount);
     event DepositWithdrawn(uint256 indexed id, address indexed writer, uint256 amount);
@@ -143,11 +163,11 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     event FeesWithdrawn(address indexed to, uint256 amount);
 
     error Paused();
+    error NotGuardian();
     error InvalidLineOrTenor();
     error SeriesExists();
     error UnknownSeries();
     error PoolUnhealthy();
-    error WallOutOfRange(int24 wallTick, int24 spotTick);
     error NotInWindow();
     error CapExceeded();
     error Slippage();
@@ -179,7 +199,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     // ------------------------------------------------------------------
 
     /// @notice Opens this week's series for a strike line and tenor. Anyone can call it.
-    /// @param line 0: strike at 80% of the 7-day mean, 1: at 60%; never above the buy wall's 24h median.
+    /// @param line 0: strike at 80% of the 7-day mean, 1: at 60%; capped by the buy wall's 24h median.
     /// @param tenorId 0: 7 days, 1: 30 days, counted from the end of the auction.
     function openSeries(uint8 line, uint8 tenorId) external returns (uint256 id) {
         if (paused) revert Paused();
@@ -189,9 +209,9 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         if (!recorder.healthy()) revert PoolUnhealthy();
 
         (uint256 strike, uint256 spot) = _strikeAndSpot(line);
+        uint256 sigma = Math.max(sigmaFloor, recorder.realizedVol(MEAN_SLOTS, VOL_MIN_PAIRS) * VOL_MARKUP_BPS / 10_000);
         uint256 tenor = tenorSeconds(tenorId);
-        uint256 floorRate = OptionMath.putRate(spot, strike, sigmaFloor, tenor + AUCTION);
-        floorRate = Math.min(Math.max(floorRate, MIN_FLOOR_RATE), MAX_FLOOR_RATE);
+        uint256 floorRate = OptionMath.putRate(spot, strike, sigma, tenor + AUCTION);
 
         id = ++seriesCount;
         seriesByKey[key] = id;
@@ -200,9 +220,15 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         s.expiry = uint64(block.timestamp + DEPOSIT_WINDOW + AUCTION + tenor);
         s.line = line;
         s.tenorId = tenorId;
+        s.protocolFeeBps = uint16(protocolFeeBps);
+        s.loanFeeBps = uint16(loanFeeBps);
+        s.loanLtvBps = uint16(loanLtvBps);
         s.strike = strike;
-        s.floorRate = floorRate;
-        emit SeriesOpened(id, line, tenorId, strike, floorRate, s.auctionStart, s.expiry);
+        s.sigma = sigma;
+        s.floorRate = Math.min(Math.max(floorRate, MIN_FLOOR_RATE), MAX_FLOOR_RATE);
+        s.simdRate = simd.convertToAssets(1e24);
+        s.depositCap = maxSeriesDeposits;
+        emit SeriesOpened(id, line, tenorId, strike, sigma, s.floorRate, s.auctionStart, s.expiry);
     }
 
     /// @notice The strike and the 24h mean price a series would open with now, in wei of ETH per 1e18 IMD.
@@ -211,14 +237,19 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         return _strikeAndSpot(line);
     }
 
+    /// @dev The line's strike, lowered to the buy wall's 24h median when the wall sits between the market
+    /// and 50% below it. A wall at or above the market (being filled) is ignored, and a wall further down is
+    /// treated as 50% below, so moving the wall can never block a series.
     function _strikeAndSpot(uint8 line) internal view returns (uint256 strike, uint256 spot) {
         int24 meanTick = recorder.meanTick(MEAN_SLOTS, MEAN_MIN_VALID);
         int24 spotTick = recorder.meanTick(SPOT_SLOTS, SPOT_MIN_VALID);
         int24 wallTick = recorder.medianWallTick(SPOT_SLOTS, SPOT_MIN_VALID);
-        if (wallTick < spotTick || wallTick - spotTick > MAX_WALL_DISCOUNT) revert WallOutOfRange(wallTick, spotTick);
         // A higher tick is a lower IMD price, so the larger tick is the lower strike.
-        int256 lineTick = int256(meanTick) + lineOffset(line);
-        int256 strikeTick = lineTick > wallTick ? lineTick : int256(wallTick);
+        int256 strikeTick = int256(meanTick) + lineOffset(line);
+        if (wallTick > spotTick) {
+            int256 wall = int256(wallTick) - spotTick > MAX_WALL_DISCOUNT ? int256(spotTick) + MAX_WALL_DISCOUNT : wallTick;
+            if (wall > strikeTick) strikeTick = wall;
+        }
         if (strikeTick > TickMath.MAX_TICK) strikeTick = TickMath.MAX_TICK;
         strike = TickPrice.ethPerImd(int24(strikeTick));
         spot = TickPrice.ethPerImd(spotTick);
@@ -233,26 +264,30 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         return tenorId == 0 ? 7 days : 30 days;
     }
 
-    /// @notice Premium rate (fraction of strike notional) during the auction: twice the floor at the start,
-    /// falling linearly to the floor at the end.
+    /// @notice Premium rate (fraction of strike notional) now: twice the floor at the start of the auction,
+    /// falling linearly to the floor at its end. The floor is the larger of the floor at opening and the
+    /// put's value at the current pessimistic price over the time left to expiry.
     function premiumRate(uint256 id) public view returns (uint256) {
         Series storage s = _series(id);
-        if (block.timestamp < s.auctionStart || block.timestamp >= s.auctionStart + AUCTION) revert NotInWindow();
+        _requireAuction(s);
+        uint256 spot = TickPrice.ethPerImd(recorder.pessimisticTick());
+        uint256 floorRate = Math.max(s.floorRate, OptionMath.putRate(spot, s.strike, s.sigma, s.expiry - block.timestamp));
         uint256 remaining = s.auctionStart + AUCTION - block.timestamp;
-        return s.floorRate + Math.mulDiv(s.floorRate, remaining, AUCTION);
+        return floorRate + Math.mulDiv(floorRate, remaining, AUCTION);
     }
 
     // ------------------------------------------------------------------
     // Writers
     // ------------------------------------------------------------------
 
-    /// @notice Adds ETH to a series' writer pool during its deposit window.
+    /// @notice Adds ETH to a series' writer pool during its deposit window. There is no first-come limit:
+    /// if deposits exceed the series cap, every writer is put at risk pro rata and the excess is released
+    /// after the auction.
     function deposit(uint256 id) external payable nonReentrant {
         if (paused) revert Paused();
         if (msg.value == 0) revert ZeroAmount();
         Series storage s = _series(id);
         if (block.timestamp >= s.auctionStart) revert NotInWindow();
-        if (s.deposits + msg.value > maxSeriesDeposits) revert CapExceeded();
         s.deposits += msg.value;
         writerDeposit[id][msg.sender] += msg.value;
         emit Deposited(id, msg.sender, msg.value);
@@ -268,7 +303,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         Address.sendValue(payable(msg.sender), amount);
     }
 
-    /// @notice After the auction, returns the writer's share of the capacity no ticket or loan used.
+    /// @notice After the auction, returns the writer's share of the ETH no ticket or open loan used.
     function claimRelease(uint256 id) external nonReentrant returns (uint256 amount) {
         Series storage s = _series(id);
         if (block.timestamp < s.auctionStart + AUCTION) revert NotInWindow();
@@ -279,10 +314,19 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         if (amount != 0) Address.sendValue(payable(msg.sender), amount);
     }
 
-    /// @notice ETH capacity left unused at the end of the auction, shared pro rata by writers.
+    /// @notice Writer ETH not backing a ticket or a loan still open at the end of the auction. Final once
+    /// the auction has ended.
     function releasedEth(uint256 id) public view returns (uint256) {
         Series storage s = series[id];
-        return s.deposits - s.ticketCollateral - s.loanPrincipal;
+        return s.deposits - s.ticketCollateral - (s.loanPrincipal - s.loanRepaidInAuction);
+    }
+
+    /// @notice ETH a sale or loan can still put at risk in a series.
+    function capacityLeft(uint256 id) public view returns (uint256) {
+        Series storage s = series[id];
+        uint256 cap = Math.min(s.deposits, s.depositCap);
+        uint256 used = s.ticketCollateral + s.loanPrincipal - s.loanRepaid;
+        return cap > used ? cap - used : 0;
     }
 
     /// @notice Freezes a series' final balances once its exercise window has closed. Anyone can call it;
@@ -292,7 +336,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         if (s.finalized) return;
         if (block.timestamp < s.expiry + EXERCISE_WINDOW) revert NotInWindow();
         s.finalized = true;
-        s.finalEth = s.ticketCollateral + s.premiums + s.loanFees + s.loanRepaid - s.exercisePaid;
+        s.finalEth = s.ticketCollateral + s.premiums + s.loanFees + s.loanRepaid - s.loanRepaidInAuction - s.exercisePaid;
         s.finalSimd = s.simdDelivered + s.loanCollateral;
         openTicketCollateral -= s.ticketCollateral;
         openLoanPrincipal -= s.loanPrincipal - s.loanRepaid;
@@ -335,11 +379,11 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         uint256 collateral = Math.mulDiv(imdAmount, s.strike, 1e18, Math.Rounding.Ceil);
         premium = Math.mulDiv(collateral, premiumRate(id), 1e18, Math.Rounding.Ceil);
         if (premium > maxPremium || premium > msg.value) revert Slippage();
-        if (s.ticketCollateral + s.loanPrincipal + collateral > s.deposits) revert CapExceeded();
+        if (collateral > capacityLeft(id)) revert CapExceeded();
         if (ticketCollateralOf[id][msg.sender] + collateral > maxAccountCollateral) revert CapExceeded();
         if (openTicketCollateral + collateral > maxOpenTicketCollateral) revert CapExceeded();
 
-        uint256 fee = premium * protocolFeeBps / 10_000;
+        uint256 fee = premium * s.protocolFeeBps / 10_000;
         feesAccrued += fee;
         s.premiums += premium - fee;
         s.ticketCollateral += collateral;
@@ -378,10 +422,12 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     // Floor Loans
     // ------------------------------------------------------------------
 
-    /// @notice Borrows ETH against sIMD during the auction. Principal is `loanLtvBps` of the sIMD's IMD
-    /// value at the strike; the fee is taken upfront. There is no price liquidation: repay before the
-    /// exercise window closes, or the sIMD goes to the writers.
-    function borrow(uint256 id, uint256 shares, uint256 minPrincipal)
+    /// @notice Borrows ETH against sIMD during the auction. Principal is the series' loan-to-value of the
+    /// sIMD's IMD value at the lower of the strike and the current pessimistic price. The fee, taken
+    /// upfront, is the larger of the series' loan fee and the value of the put the loan embeds. There is
+    /// no price liquidation: repay before the exercise window closes, or the sIMD goes to the writers.
+    /// @param minReceived The least ETH the caller accepts after the fee.
+    function borrow(uint256 id, uint256 shares, uint256 minReceived)
         external
         nonReentrant
         returns (uint256 loanId, uint256 principal)
@@ -389,20 +435,22 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         if (paused) revert Paused();
         if (shares == 0) revert ZeroAmount();
         Series storage s = _series(id);
-        if (block.timestamp < s.auctionStart || block.timestamp >= s.auctionStart + AUCTION) revert NotInWindow();
+        _requireAuction(s);
 
-        uint256 rate = Math.min(
-            simd.convertToAssets(1e24), recorder.recentSimdRate() * (10_000 + SIMD_RATE_TOLERANCE_BPS) / 10_000
+        uint256 rate = Math.min(simd.convertToAssets(1e24), s.simdRate * (10_000 + SIMD_RATE_TOLERANCE_BPS) / 10_000);
+        uint256 spot = TickPrice.ethPerImd(recorder.pessimisticTick());
+        uint256 loanStrike = Math.min(s.strike, spot) * s.loanLtvBps / 10_000; // ETH lent per IMD
+        principal = Math.mulDiv(Math.mulDiv(shares, rate, 1e24), loanStrike, 1e18);
+        uint256 feeRate = Math.max(
+            uint256(s.loanFeeBps) * 1e14,
+            OptionMath.putRate(spot, loanStrike, s.sigma, s.expiry + EXERCISE_WINDOW - block.timestamp)
         );
-        uint256 imdValue = Math.mulDiv(shares, rate, 1e24);
-        principal = Math.mulDiv(Math.mulDiv(imdValue, s.strike, 1e18), loanLtvBps, 10_000);
-        if (principal == 0 || principal < minPrincipal) revert Slippage();
-        if (principal > maxLoanPrincipal) revert CapExceeded();
-        if (s.ticketCollateral + s.loanPrincipal + principal > s.deposits) revert CapExceeded();
+        uint256 fee = Math.mulDiv(principal, feeRate, 1e18, Math.Rounding.Ceil);
+        if (principal == 0 || fee >= principal || principal - fee < minReceived) revert Slippage();
+        if (principal > maxLoanPrincipal || principal > capacityLeft(id)) revert CapExceeded();
         if (openLoanPrincipal + principal > maxOpenLoanPrincipal) revert CapExceeded();
 
-        uint256 fee = principal * loanFeeBps / 10_000;
-        uint256 protocolCut = fee * protocolFeeBps / 10_000;
+        uint256 protocolCut = fee * s.protocolFeeBps / 10_000;
         feesAccrued += protocolCut;
         s.loanFees += fee - protocolCut;
         s.loanPrincipal += principal;
@@ -426,6 +474,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         if (msg.value != loan.principal) revert WrongAmount();
         loan.closed = true;
         s.loanRepaid += loan.principal;
+        if (block.timestamp < s.auctionStart + AUCTION) s.loanRepaidInAuction += loan.principal;
         s.loanCollateral -= loan.shares;
         openLoanPrincipal -= loan.principal;
         emit Repaid(loanId, msg.sender);
@@ -433,7 +482,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     }
 
     // ------------------------------------------------------------------
-    // Owner
+    // Owner and guardian
     // ------------------------------------------------------------------
 
     function setCaps(
@@ -451,6 +500,7 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         emit SettingsUpdated();
     }
 
+    /// @notice Pricing for series opened from now on.
     function setPricing(uint256 protocolFeeBps_, uint256 loanFeeBps_, uint256 loanLtvBps_, uint256 sigmaFloor_)
         external
         onlyOwner
@@ -464,9 +514,21 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
         emit SettingsUpdated();
     }
 
-    function setPaused(bool paused_) external onlyOwner {
-        paused = paused_;
-        emit PausedSet(paused_);
+    function setGuardian(address guardian_) external onlyOwner {
+        guardian = guardian_;
+        emit SettingsUpdated();
+    }
+
+    /// @notice Stops new series, deposits, ticket sales and loans. The owner or the guardian can pause.
+    function pause() external {
+        if (msg.sender != owner() && msg.sender != guardian) revert NotGuardian();
+        paused = true;
+        emit PausedSet(true);
+    }
+
+    function unpause() external onlyOwner {
+        paused = false;
+        emit PausedSet(false);
     }
 
     function setFeeRecipient(address feeRecipient_) external onlyOwner {
@@ -490,5 +552,9 @@ contract Wallstrike is ERC1155, Ownable2Step, ReentrancyGuard {
     function _series(uint256 id) internal view returns (Series storage s) {
         s = series[id];
         if (s.auctionStart == 0) revert UnknownSeries();
+    }
+
+    function _requireAuction(Series storage s) internal view {
+        if (block.timestamp < s.auctionStart || block.timestamp >= s.auctionStart + AUCTION) revert NotInWindow();
     }
 }

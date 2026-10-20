@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {PoolId} from "v4-core/types/PoolId.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ICappedBurnHook} from "./interfaces/ICappedBurnHook.sol";
 import {IStakedIMD} from "./interfaces/IStakedIMD.sol";
 
@@ -24,6 +25,9 @@ contract ImdPriceRecorder {
     int24 public constant MAX_DIVERGENCE = 400;
     /// @notice A sample is invalid if the hook owner has loosened refTick's rate limit beyond this.
     int24 public constant MAX_REF_STEP = 200;
+    uint256 internal constant SLOTS_PER_YEAR = 365 days / INTERVAL;
+    /// @notice ln(1.0001) in 18-decimal fixed point: the log-price change of one tick.
+    uint256 internal constant LN_TICK_WAD = 99995000333308;
 
     struct Sample {
         uint32 slot;
@@ -118,6 +122,42 @@ contract ImdPriceRecorder {
             ticks[j] = key;
         }
         return ticks[count / 2];
+    }
+
+    /// @notice Annualized volatility (1e18 = 100%) of refTick across consecutive valid samples in the last
+    /// `slots` slots. Reverts unless at least `minPairs` consecutive pairs exist. refTick is rate limited,
+    /// so this understates sudden moves; callers add a markup.
+    function realizedVol(uint256 slots, uint256 minPairs) external view returns (uint256) {
+        uint32 current = _currentSlot();
+        uint256 sumSq;
+        uint256 pairs;
+        bool havePrev;
+        int256 prev;
+        for (uint256 i; i < slots && i <= current; ++i) {
+            Sample memory s = _samples[(current - i) % RING];
+            if (s.slot == current - i && s.valid) {
+                if (havePrev) {
+                    int256 d = prev - s.refTick;
+                    sumSq += uint256(d * d);
+                    ++pairs;
+                }
+                prev = s.refTick;
+                havePrev = true;
+            } else {
+                havePrev = false;
+            }
+        }
+        if (pairs < minPairs || pairs == 0) revert NotEnoughSamples(pairs, minPairs);
+        return Math.sqrt(sumSq * SLOTS_PER_YEAR * LN_TICK_WAD * LN_TICK_WAD / pairs);
+    }
+
+    /// @notice The higher tick (the cheaper IMD price) of POOL4's current refTick and the main pool's
+    /// current tick. Pricing puts off the lower price never undercharges writers; whoever moves the main
+    /// pool to raise a price only makes buyers walk away.
+    function pessimisticTick() external view returns (int24) {
+        int24 ref = hook.refTick();
+        (, int24 mainTick,,) = poolManager.getSlot0(mainPoolId);
+        return ref > mainTick ? ref : mainTick;
     }
 
     /// @notice The sIMD rate (IMD per 1e24 shares) of the most recent valid sample in the current or
