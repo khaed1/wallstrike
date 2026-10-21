@@ -40,3 +40,17 @@ Documented rather than changed: the vault's unused ETH stays in Wallstrike until
 - Accept wstETH from writers so idle capital earns staking yield.
 - Make vault shares transferable (an ERC-20).
 - Sell only when terms are acceptable: an optional minimum premium or maximum strike for the vault.
+
+## imdUSD
+
+[imdUSD](https://imdusd.com) is a third-party stablecoin (source: [fa11up/infer-protocol](https://github.com/fa11up/infer-protocol)) borrowed against sIMD. Its vault was deployed on 2026-10-11 (`0x0b69F8DA8D8cE521d74Ea69a7A3475B77302EF82`). On 2026-10-21 it had about 145.8k imdUSD in circulation, about 147.3k of debt against a 1M ceiling, sIMD collateral worth about 82.6k IMD, and a 170% minimum collateral ratio. Its IMD price comes from IdentityMD oracle panels signed by one key, and it has its own token, INFER, distributed through points.
+
+**Decision so far: don't use imdUSD as money inside Wallstrike.** Writers backing tickets with imdUSD, or strikes set in imdUSD, would pay out in a currency backed by the same IMD the tickets insure. Tickets pay when IMD crashes, which is when imdUSD is most likely to slip below $1. If dollar strikes are ever wanted, use a stablecoin that does not depend on IMD.
+
+**Do treat imdUSD borrowers as customers.** Their sIMD collateral is what Wallstrike tickets protect. [docs/imdusd-hedge.md](docs/imdusd-hedge.md) sketches a "hedge your imdUSD position" front-end flow. Tickets hedge the collateral's value at expiry; they do not stop a liquidation in the middle of a week. Phase 2 of the sketch is a one-click "close the position at the strike" helper.
+
+**Watch:**
+
+- Their oracle and Wallstrike's recorder read the same IMD pools; an attack holding a pool down for hours affects both.
+- An imdUSD liquidation cascade sends sIMD to liquidators who must sell it; Wallstrike writers end up buying it. Keep caps conservative while both protocols are young.
+- Talk to the imdUSD builder: a "protect this position" link from their terminal could suit both protocols.
